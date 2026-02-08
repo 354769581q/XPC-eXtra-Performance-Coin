@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+
+/**
+ * @title XPC - eXtra Performance Coin
+ * @dev XPC is a high-performance governance and staking token with deflationary mechanics.
+ * Combines ERC20 standard with staking rewards, burn-on-transfer, and role-based access control.
+ */
+contract XPC is ERC20, ERC20Burnable, ERC20Pausable, AccessControl, ReentrancyGuard, ERC20Permit {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant STAKING_MANAGER_ROLE = keccak256("STAKING_MANAGER_ROLE");
+
+    uint256 public constant MAX_SUPPLY = 500_000_000 * 10 ** decimals(); // 500M max supply
+    uint256 public burnRateOnTransfer = 200; // 2% burn rate (basis points)
+    uint256 public stakingRewardRate = 1200; // 12% APY in basis points
+
+    struct Staker {
+        uint256 stakedAmount;
+        uint256 rewardDebt;
+        uint256 lastClaimTime;
+    }
+
+    mapping(address => Staker) public stakers;
+    uint256 public totalStaked;
+
+    event TokensStaked(address indexed user, uint256 amount);
+    event TokensUnstaked(address indexed user, uint256 amount, uint256 rewards);
+    event RewardsClaimed(address indexed user, uint256 amount);
+    event BurnRateUpdated(uint256 newRate);
+    event StakingRewardRateUpdated(uint256 newRate);
+
+    constructor(address admin) ERC20("eXtra Performance Coin", "XPC") ERC20Permit("eXtra Performance Coin") {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(MINTER_ROLE, admin);
+        _grantRole(PAUSER_ROLE, admin);
+        _grantRole(STAKING_MANAGER_ROLE, admin);
+
+        // Mint initial supply to deployer
+        _mint(admin, 100_000_000 * 10 ** decimals());
+    }
+
+    /**
+     * @dev Mint new tokens (MINTER_ROLE only)
+     */
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
+        require(totalSupply() + amount <= MAX_SUPPLY, "Exceeds max supply");
+        _mint(to, amount);
+    }
+
+    /**
+     * @dev Pause transfers (PAUSER_ROLE only)
+     */
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause transfers (PAUSER_ROLE only)
+     */
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /**
+     * @dev Update burn rate (STAKING_MANAGER_ROLE only)
+     */
+    function setBurnRate(uint256 newRate) external onlyRole(STAKING_MANAGER_ROLE) {
+        require(newRate <= 1000, "Burn rate too high"); // Max 10%
+        burnRateOnTransfer = newRate;
+        emit BurnRateUpdated(newRate);
+    }
+
+    /**
+     * @dev Update staking reward rate (STAKING_MANAGER_ROLE only)
+     */
+    function setStakingRewardRate(uint256 newRate) external onlyRole(STAKING_MANAGER_ROLE) {
+        require(newRate <= 5000, "Reward rate too high"); // Max 50% APY
+        stakingRewardRate = newRate;
+        emit StakingRewardRateUpdated(newRate);
+    }
+
+    /**
+     * @dev Override transfer to include burn mechanism
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override whenNotPaused nonReentrant {
+        require(from != address(0), "Transfer from zero");
+        require(to != address(0), "Transfer to zero");
+
+        uint256 burnAmount = 0;
+        if (from != owner() && to != owner() && !hasRole(DEFAULT_ADMIN_ROLE, from) && burnRateOnTransfer > 0) {
+            burnAmount = (amount * burnRateOnTransfer) / 10000;
+            if (burnAmount > 0) {
+                super._burn(from, burnAmount);
+            }
+        }
+
+        uint256 transferAmount = amount - burnAmount;
+        super._transfer(from, to, transferAmount);
+    }
+
+    /**
+     * @dev Stake tokens
+     */
+    function stake(uint256 amount) external nonReentrant whenNotPaused {
+        require(amount > 0, "Amount must be positive");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+
+        Staker storage s = stakers[msg.sender];
+        _updateStakingReward(msg.sender);
+
+        super._transfer(msg.sender, address(this), amount);
+        s.stakedAmount += amount;
+        totalStaked += amount;
+
+        emit TokensStaked(msg.sender, amount);
+    }
+
+    /**
+     * @dev Unstake tokens
+     */
+    function unstake(uint256 amount) external nonReentrant whenNotPaused {
+        require(amount > 0, "Amount must be positive");
+        Staker storage s = stakers[msg.sender];
+        require(s.stakedAmount >= amount, "Not enough staked");
+
+        _updateStakingReward(msg.sender);
+
+        s.stakedAmount -= amount;
+        totalStaked -= amount;
+        super._transfer(address(this), msg.sender, amount);
+
+        uint256 rewards = s.rewardDebt;
+        if (rewards > 0) {
+            _mint(msg.sender, rewards);
+            s.rewardDebt = 0;
+            emit RewardsClaimed(msg.sender, rewards);
+        }
+
+        emit TokensUnstaked(msg.sender, amount, rewards);
+    }
+
+    /**
+     * @dev Claim staking rewards separately
+     */
+    function claimRewards() external nonReentrant whenNotPaused {
+        _updateStakingReward(msg.sender);
+        Staker storage s = stakers[msg.sender];
+        uint256 rewards = s.rewardDebt;
+        require(rewards > 0, "No rewards");
+        s.rewardDebt = 0;
+        _mint(msg.sender, rewards);
+        emit RewardsClaimed(msg.sender, rewards);
+    }
+
+    /**
+     * @dev Internal: calculate pending rewards
+     */
+    function _updateStakingReward(address user) private {
+        Staker storage s = stakers[user];
+        if (s.stakedAmount == 0 || s.lastClaimTime == 0) return;
+
+        uint256 timeElapsed = block.timestamp - s.lastClaimTime;
+        uint256 rewards = (s.stakedAmount * stakingRewardRate * timeElapsed) / (365 days * 10000);
+        s.rewardDebt += rewards;
+        s.lastClaimTime = block.timestamp;
+    }
+
+    /**
+     * @dev Get staking info
+     */
+    function getStakingInfo(address user)
+        external
+        view
+        returns (
+            uint256 stakedAmount,
+            uint256 pendingRewards,
+            uint256 rewardRate
+        )
+    {
+        Staker memory s = stakers[user];
+        return (s.stakedAmount, s.rewardDebt, stakingRewardRate);
+    }
+}
